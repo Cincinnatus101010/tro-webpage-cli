@@ -1,0 +1,43 @@
+[package]
+name = "tro"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fetch URLs and print readable text for LLM doc reading"
+repository = "https://github.com/Cincinnatus101010/tro-webpage-cli"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tro"
+path = "src/main.rs"
+
+[[bin]]
+name = "tro-mcp"
+path = "src/mcp.rs"
+
+[dependencies]
+html5ever = "0.39"
+markup5ever_rcdom = "0.39.0-unofficial"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+url = "2"
+rayon = "1.10"
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3"
+url = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "tro": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--release",
+        "--manifest-path",
+        "${workspaceFolder}/Cargo.toml",
+        "--bin",
+        "tro-mcp"
+      ]
+    }
+  }
+}
