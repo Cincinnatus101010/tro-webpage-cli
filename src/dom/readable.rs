@@ -59,12 +59,27 @@ pub fn extract_html_with_options(html: &str, opts: &ExtractOptions) -> Result<Re
     }
 
     let root = content_root(&dom.document);
-    let mut out = String::with_capacity(html.len().min(256 * 1024) / 4);
-    append_readable(&root, &mut out);
+    let cap = opts
+        .max_chars
+        .unwrap_or_else(|| html.len().min(256 * 1024) / 4);
+    let mut budget = TextBudget::new(opts.max_chars, cap);
+    append_readable(&root, &mut budget);
+    let mut out = budget.out;
+    let was_truncated = budget.truncated;
     normalize_in_place(&mut out);
 
-    let thin = out.len() < 320;
     let title = spa::pick_title(trim_owned(title), &dom.document);
+
+    if was_truncated {
+        finalize_truncated(&mut out);
+        return Ok(ReadablePage {
+            title,
+            text: out,
+            truncated: true,
+        });
+    }
+
+    let thin = out.len() < 320;
     let mut text = if thin {
         spa::merge_visible(&out, &dom.document, html)
     } else {
@@ -81,6 +96,59 @@ pub fn extract_html_with_options(html: &str, opts: &ExtractOptions) -> Result<Re
     })
 }
 
+struct TextBudget {
+    out: String,
+    chars: usize,
+    max: Option<usize>,
+    truncated: bool,
+}
+
+impl TextBudget {
+    fn new(max: Option<usize>, capacity: usize) -> Self {
+        Self {
+            out: String::with_capacity(capacity),
+            chars: 0,
+            max,
+            truncated: false,
+        }
+    }
+
+    fn at_limit(&self) -> bool {
+        self.truncated || self.max.is_some_and(|m| self.chars >= m)
+    }
+
+    /// Append one character. Returns `false` when the budget is exhausted.
+    fn push_char(&mut self, ch: char) -> bool {
+        if self.at_limit() {
+            self.truncated = true;
+            return false;
+        }
+        self.out.push(ch);
+        self.chars += 1;
+        if self.max.is_some_and(|m| self.chars >= m) {
+            self.truncated = true;
+            return false;
+        }
+        true
+    }
+
+    /// Append a string. Returns `false` when the budget is exhausted mid-string.
+    fn push_str(&mut self, s: &str) -> bool {
+        for ch in s.chars() {
+            if !self.push_char(ch) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn finalize_truncated(text: &mut String) {
+    if !text.ends_with("[truncated]") {
+        text.push_str("\n\n[truncated]");
+    }
+}
+
 #[derive(Default)]
 struct Attrs<'a> {
     alt: Option<&'a str>,
@@ -91,13 +159,16 @@ struct Attrs<'a> {
 }
 
 #[inline]
-fn append_readable(handle: &Handle, out: &mut String) {
+fn append_readable(handle: &Handle, budget: &mut TextBudget) -> bool {
+    if budget.at_limit() {
+        return false;
+    }
     match &handle.data {
-        NodeData::Text { contents } => push_words(out, contents.borrow().as_ref()),
+        NodeData::Text { contents } => push_words(budget, contents.borrow().as_ref()),
         NodeData::Element { name, attrs, .. } => {
             let tag = name.local.as_ref();
             if skip_tag_name(tag) {
-                return;
+                return true;
             }
 
             let attrs_ref = attrs.borrow();
@@ -114,46 +185,66 @@ fn append_readable(handle: &Handle, out: &mut String) {
             }
 
             if skip_attrs(&parsed) {
-                return;
+                return true;
             }
-            if is_block(tag) && needs_break(out) {
-                out.push('\n');
+            if is_block(tag) && needs_break(&budget.out) {
+                if !budget.push_char('\n') {
+                    return false;
+                }
             }
             let children = handle.children.borrow();
             match tag {
-                "br" => out.push('\n'),
+                "br" => budget.push_char('\n'),
                 "hr" => {
-                    if needs_break(out) {
-                        out.push('\n');
+                    if needs_break(&budget.out) && !budget.push_char('\n') {
+                        return false;
                     }
-                    out.push_str("---\n");
+                    budget.push_str("---\n")
                 }
                 "li" => {
-                    out.push_str("- ");
-                    for child in children.iter() {
-                        append_readable(child, out);
+                    if !budget.push_str("- ") {
+                        return false;
                     }
-                    out.push('\n');
+                    for child in children.iter() {
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
+                    }
+                    budget.push_char('\n')
                 }
                 "img" => {
                     if let Some(alt) = parsed.alt {
                         let alt = alt.trim();
                         if !alt.is_empty() {
-                            push_words(out, alt);
+                            push_words(budget, alt)
+                        } else {
+                            true
                         }
+                    } else {
+                        true
                     }
                 }
                 "a" => {
                     for child in children.iter() {
-                        append_readable(child, out);
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
                     }
                     if let Some(href) = parsed.href {
                         let href = href.trim();
                         if link_url_is_useful(href) && !href.starts_with('/') {
-                            out.push_str(" (");
-                            out.push_str(href);
-                            out.push(')');
+                            if !budget.push_str(" (") {
+                                return false;
+                            }
+                            if !push_words(budget, href) {
+                                return false;
+                            }
+                            budget.push_char(')')
+                        } else {
+                            true
                         }
+                    } else {
+                        true
                     }
                 }
                 "tr" => {
@@ -161,39 +252,50 @@ fn append_readable(handle: &Handle, out: &mut String) {
                     for child in children.iter() {
                         if first_cell {
                             first_cell = false;
-                        } else {
-                            out.push('\t');
+                        } else if !budget.push_char('\t') {
+                            return false;
                         }
-                        append_readable(child, out);
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
                     }
-                    out.push('\n');
+                    budget.push_char('\n')
                 }
                 "td" | "th" => {
                     for child in children.iter() {
-                        append_readable(child, out);
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
                     }
+                    true
                 }
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     for child in children.iter() {
-                        append_readable(child, out);
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
                     }
-                    out.push_str("\n\n");
+                    budget.push_str("\n\n")
                 }
                 _ => {
                     for child in children.iter() {
-                        append_readable(child, out);
+                        if !append_readable(child, budget) {
+                            return false;
+                        }
                     }
                     if matches!(
                         tag,
                         "p" | "div" | "blockquote" | "pre" | "section" | "article" | "main"
                             | "ul" | "ol" | "table" | "figcaption"
                     ) {
-                        out.push('\n');
+                        budget.push_char('\n')
+                    } else {
+                        true
                     }
                 }
             }
         }
-        _ => {}
+        _ => true,
     }
 }
 
@@ -362,39 +464,46 @@ fn link_url_is_useful(href: &str) -> bool {
 }
 
 #[inline]
-fn push_words(out: &mut String, text: &str) {
+fn push_words(budget: &mut TextBudget, text: &str) -> bool {
     if text.as_bytes().iter().all(|b| b.is_ascii()) {
-        push_words_ascii(out, text.as_bytes());
-        return;
+        return push_words_ascii(budget, text.as_bytes());
     }
     let mut space = false;
     for ch in text.chars() {
         if ch.is_whitespace() {
-            if !space && !out.is_empty() && !out.ends_with('\n') {
-                out.push(' ');
+            if !space && !budget.out.is_empty() && !budget.out.ends_with('\n') {
+                if !budget.push_char(' ') {
+                    return false;
+                }
                 space = true;
             }
+        } else if !budget.push_char(ch) {
+            return false;
         } else {
-            out.push(ch);
             space = false;
         }
     }
+    true
 }
 
 #[inline]
-fn push_words_ascii(out: &mut String, text: &[u8]) {
+fn push_words_ascii(budget: &mut TextBudget, text: &[u8]) -> bool {
     let mut space = false;
     for &b in text {
         if b.is_ascii_whitespace() {
-            if !space && !out.is_empty() && !out.ends_with('\n') {
-                out.push(' ');
+            if !space && !budget.out.is_empty() && !budget.out.ends_with('\n') {
+                if !budget.push_char(' ') {
+                    return false;
+                }
                 space = true;
             }
+        } else if !budget.push_char(b as char) {
+            return false;
         } else {
-            out.push(b as char);
             space = false;
         }
     }
+    true
 }
 
 fn normalize_in_place(out: &mut String) {

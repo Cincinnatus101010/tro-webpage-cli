@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use tro::{extract_url_with_options, extract_urls, ExtractOptions};
+use std::sync::OnceLock;
+use tro::{
+    extract_url_cached, extract_urls_cached, ExtractOptions, PageCache,
+};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -99,6 +102,11 @@ fn opts(max_chars: Option<usize>) -> ExtractOptions {
     ExtractOptions { max_chars }
 }
 
+fn page_cache() -> &'static PageCache {
+    static CACHE: OnceLock<PageCache> = OnceLock::new();
+    CACHE.get_or_init(PageCache::default)
+}
+
 fn tool_result(id: Value, value: Value, is_error: bool) -> RpcResponse {
     ok(
         id,
@@ -135,7 +143,7 @@ fn handle_request(req: RpcRequest) -> Option<RpcResponse> {
                     if args.url.is_empty() {
                         return Some(err(id, -32602, "missing url"));
                     }
-                    return match extract_url_with_options(&args.url, &opts(args.max_chars)) {
+                    return match extract_url_cached(page_cache(), &args.url, &opts(args.max_chars)) {
                         Ok(page) => Some(tool_result(
                             id,
                             json!({
@@ -158,7 +166,7 @@ fn handle_request(req: RpcRequest) -> Option<RpcResponse> {
                         return Some(err(id, -32602, "missing urls"));
                     }
                     let refs: Vec<&str> = args.urls.iter().map(String::as_str).collect();
-                    let pages = extract_urls(&refs, &opts(args.max_chars));
+                    let pages = extract_urls_cached(page_cache(), &refs, &opts(args.max_chars));
                     return Some(tool_result(id, json!({ "pages": pages }), false));
                 }
                 _ => Some(err(id, -32602, format!("unknown tool: {name}"))),

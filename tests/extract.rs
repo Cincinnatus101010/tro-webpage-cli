@@ -1,7 +1,10 @@
 mod common;
 
 use common::factory::{FileUrlFactory, HttpFactory, PageFactory, UrlFactory};
-use tro::{extract_html, extract_html_with_options, extract_url, extract_urls, ExtractOptions};
+use tro::{
+    extract_html, extract_html_with_options, extract_url, extract_url_cached, extract_urls,
+    extract_urls_cached, ExtractOptions, PageCache,
+};
 
 #[test]
 fn documentation_page_extracts_main_content() {
@@ -48,6 +51,56 @@ fn max_chars_truncates_output() {
     assert!(page.truncated);
     assert!(page.text.ends_with("[truncated]"));
     assert!(page.text.chars().count() < html.len());
+}
+
+#[test]
+fn max_chars_stops_during_dom_walk() {
+    let body = "x".repeat(20_000);
+    let html = PageFactory::article_in_main("Huge", &body).html;
+    let page = extract_html_with_options(
+        &html,
+        &ExtractOptions {
+            max_chars: Some(100),
+        },
+    )
+    .unwrap();
+
+    assert!(page.truncated);
+    assert!(page.text.ends_with("[truncated]"));
+    // Body chars capped at 100; marker adds a few more.
+    assert!(page.text.chars().count() <= 120);
+}
+
+#[test]
+fn page_cache_skips_repeat_fetches() {
+    let html = PageFactory::article_in_main(
+        "Cached",
+        "This page is served once then read from cache.",
+    )
+    .html;
+    let server = HttpFactory::serve_html(&html);
+    let cache = PageCache::new(8);
+    let opts = ExtractOptions::default();
+
+    let first = extract_url_cached(&cache, &server.url, &opts).unwrap();
+    let second = extract_url_cached(&cache, &server.url, &opts).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.title, "Cached");
+}
+
+#[test]
+fn page_cache_batch_reuses_entries() {
+    let html = PageFactory::documentation().html;
+    let server = HttpFactory::serve_html(&html);
+    let cache = PageCache::new(8);
+    let opts = ExtractOptions::default();
+    let urls = [server.url.as_str()];
+
+    let _ = extract_urls_cached(&cache, &urls, &opts);
+    let again = extract_urls_cached(&cache, &urls, &opts);
+    assert_eq!(again.len(), 1);
+    assert!(again[0].error.is_none());
+    assert!(again[0].text.as_ref().unwrap().contains("extract_url"));
 }
 
 #[test]
